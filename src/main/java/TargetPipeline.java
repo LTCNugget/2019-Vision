@@ -12,7 +12,7 @@ import org.opencv.imgproc.Imgproc;
 
 import edu.wpi.first.vision.VisionPipeline;
 
-public class HatchPipeline implements VisionPipeline {
+public class TargetPipeline implements VisionPipeline {
 
 	// Outputs
 	private Mat hslThresholdOutput = new Mat();
