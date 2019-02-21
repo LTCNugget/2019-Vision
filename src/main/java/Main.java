@@ -3,6 +3,7 @@ import java.nio.file.Files;
 import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.stream.Collectors;
 
 import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
@@ -21,10 +22,8 @@ import org.opencv.core.RotatedRect;
 import org.opencv.core.Scalar;
 import org.opencv.imgproc.Imgproc;
 
-import edu.wpi.cscore.CvSource;
 import edu.wpi.cscore.MjpegServer;
 import edu.wpi.cscore.UsbCamera;
-import edu.wpi.cscore.VideoMode;
 import edu.wpi.cscore.VideoSource;
 import edu.wpi.first.cameraserver.CameraServer;
 import edu.wpi.first.networktables.EntryListenerFlags;
@@ -46,7 +45,7 @@ public final class Main {
 	public static boolean server;
 	public static List<CameraConfig> cameraConfigs = new ArrayList<>();
 
-	public static int hudSource;
+	public static int source;
 	public static final int hatchCamera = 1, cargoCamera = 0;
 	public static Mat lastMat;
 
@@ -197,55 +196,68 @@ public final class Main {
 		}
 
 		if(cameras.size() >= 2) {
-			hudSource = (int)NetworkTableInstance.getDefault().getTable("vision").getEntry("hudSource").getDouble(0) % cameras.size();
-			ntinst.getTable("vision").addEntryListener("hudSource", (table, key, entry, value, flags) -> {
-				hudSource = (int)value.getDouble() % cameras.size();
+			source = (int)NetworkTableInstance.getDefault().getTable("vision").getEntry("source").getDouble(0) % cameras.size();
+			ntinst.getTable("vision").addEntryListener("source", (table, key, entry, value, flags) -> {
+				source = (int)value.getDouble() % cameras.size();
 			}, EntryListenerFlags.kNew | EntryListenerFlags.kUpdate);
-
-			CvSource hudOutSource = new CvSource("HUD", new VideoMode(VideoMode.PixelFormat.kMJPEG, 640, 360, 30));
-			MjpegServer hudServer = CameraServer.getInstance().startAutomaticCapture(hudOutSource);
-			Thread hudThread = new Thread(() -> {
-				GripHUDPipeline hudPipeline = new GripHUDPipeline();
-				while(running) {
-					if(lastMat != null && hudOutSource.isEnabled()) {
-						Mat mat = lastMat;
-						hudPipeline.process(mat);
-						mat = hudPipeline.cvCrosshairHOutput();
-
-						if(hudSource == hatchCamera) {
-							if(leftRect  != null) drawMinAreaRect(mat, leftRect, new Scalar(0, 0, 255));
-							if(rightRect != null) drawMinAreaRect(mat, rightRect, new Scalar(255, 0, 0));
-						}
-
-						hudOutSource.putFrame(mat);
-					}
-				}
-			});
 
 			Thread grabMatThread = new Thread(() -> {
 				lastMat = new Mat();
 				while(running) {
-					CameraServer.getInstance().getVideo(cameras.get(hudSource)).grabFrame(lastMat);
+					CameraServer.getInstance().getVideo(cameras.get(source)).grabFrame(lastMat);
 				}
 			});
 
-			VisionThread hatchThread = new VisionThread(cameras.get(hatchCamera), new GripHatchPipeline(), (pipeline) -> {
-				RotatedRect[] rotatedRects = findHatchTargets(pipeline.filterContoursOutput());
-				if(rotatedRects.length == 2) {
-					leftRect  = rotatedRects[0];
-					rightRect = rotatedRects[1];
-					if(rotatedRects[0] != rotatedRects[1] && diff(rotatedRects[0].angle, -75.5) < 10 && diff(rotatedRects[1].angle, -14.5) < 10) {
-						putHatchTargets(rotatedRects[0], rotatedRects[1]);
+			Thread hatchThread = new Thread(() -> {
+				HatchPipeline hatchPipeline = new HatchPipeline();
+				while(running) {
+					hatchPipeline.process(lastMat);
+					RotatedRect[] rotatedRects = findHatchTargets(hatchPipeline.filterContoursOutput());
+					if(rotatedRects.length == 2) {
+						leftRect  = rotatedRects[0];
+						rightRect = rotatedRects[1];
+						if(rotatedRects[0] != rotatedRects[1] && diff(rotatedRects[0].angle, -75.5) < 10 && diff(rotatedRects[1].angle, -14.5) < 10) {
+							putHatchTargets(rotatedRects[0], rotatedRects[1]);
+						}
+					} else {
+						resetHatchEntries();
 					}
-				} else {
-					resetHatchEntries();
+				}
+			});
+
+			Thread cargoThread = new Thread(() -> {
+				CargoPipeline cargoPipeline = new CargoPipeline();
+				while(running) {
+					cargoPipeline.process(lastMat);
+					Circle[] circles = cargoPipeline.filterContoursOutput().parallelStream().map((mat) -> {
+						Circle circle = new Circle();
+						float[] radius = new float[]{};
+						MatOfPoint2f mat2f = new MatOfPoint2f();
+						mat.convertTo(mat2f, CvType.CV_32F);
+						Imgproc.minEnclosingCircle(mat2f, circle.center, radius);
+						circle.radius = radius[0];
+						return circle;
+					}).collect(Collectors.toList()).toArray(new Circle[]{});
+
+					double[] cargoX = new double[circles.length];
+					double[] cargoY = new double[circles.length];
+					double[] cargoR = new double[circles.length];
+
+					for(int i = 0; i < circles.length; i++) {
+						cargoX[i] = circles[i].center.x;
+						cargoY[i] = circles[i].center.y;
+						cargoR[i] = circles[i].radius;
+					}
+					ntinst.getTable("vision/cargo").getEntry("x").setDoubleArray(cargoX);
+					ntinst.getTable("vision/cargo").getEntry("y").setDoubleArray(cargoY);
+					ntinst.getTable("vision/cargo").getEntry("r").setDoubleArray(cargoR);
 				}
 			});
 
 			running = true;
 			grabMatThread.start();
 			hatchThread.start();
-			hudThread.start();
+			cargoThread.start();
 		}
 
 		// loop forever
@@ -263,7 +275,7 @@ public final class Main {
 		if(rect == null) return;
 		Point[] vertices = new Point[4];
 		rect.points(vertices);
-		for (int j = 0; j < 4; j++) {
+		for(int j = 0; j < 4; j++) {
 			Imgproc.line(mat, vertices[j], vertices[(j + 1) % 4], color, 2);
 		}
 	}
@@ -294,8 +306,8 @@ public final class Main {
 
 	public static void resetHatchEntries() {
 		NetworkTableInstance ntinst = NetworkTableInstance.getDefault();
-		ntinst.getTable("vision/hatch-targets").getEntry("contour_left").setDoubleArray(new double[6]);
-		ntinst.getTable("vision/hatch-targets").getEntry("contour_right").setDoubleArray(new double[6]);
+		ntinst.getTable("vision/targets").getEntry("contour_left").setDoubleArray(new double[6]);
+		ntinst.getTable("vision/targets").getEntry("contour_right").setDoubleArray(new double[6]);
 	}
 
 	public static RotatedRect[] findHatchTargets(List<MatOfPoint> contours) {
